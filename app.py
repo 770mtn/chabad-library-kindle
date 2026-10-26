@@ -9,16 +9,24 @@ from datetime import datetime, timezone
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
+# Start with known, public HTML text pages rather than relying on the books index
+# to expose all links. These are examples of real text pages indexed by search engines.
 BASES = [
-    'https://chabadlibrary.org/books/',
+    'https://www.chabadlibrary.org/books/1400250017',
+    'https://www.chabadlibrary.org/books/1400170004',
+    'https://www.chabadlibrary.org/books/1402780104',
+    'https://www.chabadlibrary.org/books/1400310274',
+    'https://www.chabadlibrary.org/books/1400260001',
+    'https://www.chabadlibrary.org/books/1400340001',
+    'https://www.chabadlibrary.org/books/1400340015',
     'https://www.chabadlibrary.org/books/',
-    'https://chabadlibrary.org/catalog/index.php?catalog=mscatalog&frame=content&search_mode=simple',
+    'https://www.chabadlibrary.org/catalog/index.php?catalog=mscatalog&frame=content&search_mode=simple',
 ]
 ALLOWED_HOSTS = {'chabadlibrary.org', 'www.chabadlibrary.org'}
-HEADERS = {'User-Agent': 'ChabadLibraryTextLibrary/1.3 (polite public-page text indexing; contact: site owner)'}
+HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; ChabadLibraryTextLibrary/1.4; public-page text indexing)', 'Accept-Language': 'he,en;q=0.8'}
 state = {
     'running': False, 'done': False, 'error': '', 'pages': 0, 'found': 0,
-    'message': 'מוכן לסריקת טקסטים', 'items': [], 'zip_path': '', 'zip_name': '',
+    'message': 'מוכן לסריקת טקסטים — כולל דפי טקסט ידועים', 'items': [], 'zip_path': '', 'zip_name': '',
     'kind': 'text', 'skipped': 0
 }
 lock = threading.Lock()
@@ -123,7 +131,7 @@ def scan_worker(max_pages):
             time.sleep(0.35)
         with lock:
             state.update(running=False, done=True, items=sorted(found.values(), key=lambda x: x['title'].casefold()),
-                         message=f'הסריקה הסתיימה: {len(seen)} דפים, {len(found)} דפי טקסט מתאימים; דולגו {skipped}')
+                         message=f'הסריקה הסתיימה: {len(seen)} דפים, {len(found)} דפי טקסט מתאימים; דולגו {skipped}. אם נמצאו 0, פתחו את פרטי השגיאות/הלוגים ב-Render ובדקו שהשרת יכול לגשת לאתר המקור.')
     except Exception as e:
         with lock: state.update(running=False, done=True, error=str(e)[:300], message='הסריקה נכשלה')
 
