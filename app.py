@@ -1,245 +1,117 @@
-from flask import Flask, render_template, request, jsonify, send_file
-from urllib.parse import urljoin, urlparse, urldefrag
-from pathlib import Path
+from flask import Flask, render_template, request, send_file
+from urllib.request import Request, urlopen
+from urllib.parse import quote
 from html.parser import HTMLParser
 from html import escape
-from uuid import uuid4
-import threading, requests, zipfile, tempfile, os, time, re, json, mimetypes
+from io import BytesIO
 from datetime import datetime, timezone
+import json, re, zipfile, uuid, mimetypes
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
-# Start with known, public HTML text pages rather than relying on the books index
-# to expose all links. These are examples of real text pages indexed by search engines.
-BASES = [
-    'https://www.chabadlibrary.org/books/1400250017',
-    'https://www.chabadlibrary.org/books/1400170004',
-    'https://www.chabadlibrary.org/books/1402780104',
-    'https://www.chabadlibrary.org/books/1400310274',
-    'https://www.chabadlibrary.org/books/1400260001',
-    'https://www.chabadlibrary.org/books/1400340001',
-    'https://www.chabadlibrary.org/books/1400340015',
-    'https://www.chabadlibrary.org/books/',
-    'https://www.chabadlibrary.org/catalog/index.php?catalog=mscatalog&frame=content&search_mode=simple',
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024
+
+CATALOG = [
+    {"group":"הספרייה הרשמית", "title":"כל ספרי ספריית חב״ד ליובאוויטש", "description":"הקטלוג המקורי לפי סדרי הספרייה והקטגוריות", "url":"https://www.chabadlibrary.org/books/1100000000", "kind":"official"},
+    {"group":"הספרייה הרשמית", "title":"קטלוג כתבי יד וספרים", "description":"קטלוג נוסף של הספרייה", "url":"https://chabadlibrary.org/catalog/index.php?catalog=mscatalog&frame=content&search_mode=simple", "kind":"official"},
+    {"group":"ספרי הרבי", "title":"תורת מנחם", "description":"התוועדויות ושיחות הרבי; דוגמה לכרך באתר הרשמי", "url":"https://www.chabadlibrary.org/books/1400260001", "kind":"series"},
+    {"group":"ספרי הרבי", "title":"לקוטי שיחות", "description":"שיחות לפי כרכים ופרשות; קטלוג טקסטים בפנימי", "url":"https://pnimi.org/likutei-sichot-10", "kind":"series"},
+    {"group":"ספרי הרבי", "title":"אגרות קודש, מאמרים ורשימות", "description":"היכנסו לקטלוג הרשמי כדי לבחור סדרה וכרך", "url":"https://www.chabadlibrary.org/books/1100000000", "kind":"series"},
+    {"group":"ספריית טקסטים", "title":"ספריית פנימי — תוכן הספרייה", "description":"אינדקס טקסטים וחיפוש; הטקסטים מספריית חב״ד כפופים לזכויות בעליהם", "url":"https://pnimi.org/toc", "kind":"text"},
+    {"group":"ספריית טקסטים", "title":"ספריית פנימי — חיפוש ומקורות", "description":"חיפוש במקורות והפניות בין טקסטים", "url":"https://pnimi.org/sources", "kind":"text"},
+    {"group":"ספריית טקסטים", "title":"ספריא — ספרייה דיגיטלית", "description":"טקסטים רבים עם רישיונות פתוחים; יש לבדוק רישיון של כל מהדורה", "url":"https://www.sefaria.org.il/texts", "kind":"sefaria"},
 ]
-ALLOWED_HOSTS = {'chabadlibrary.org', 'www.chabadlibrary.org'}
-HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; ChabadLibraryTextLibrary/1.4; public-page text indexing)', 'Accept-Language': 'he,en;q=0.8'}
-state = {
-    'running': False, 'done': False, 'error': '', 'pages': 0, 'found': 0,
-    'message': 'מוכן לסריקת טקסטים — כולל דפי טקסט ידועים', 'items': [], 'zip_path': '', 'zip_name': '',
-    'kind': 'text', 'skipped': 0
-}
-lock = threading.Lock()
 
-def allowed_url(url):
-    p = urlparse(url)
-    return p.scheme in ('http', 'https') and p.hostname in ALLOWED_HOSTS
+ALLOWED_LICENSES = {"public domain", "public-domain", "public_domain", "pd", "cc0", "cc-by", "cc-by-sa", "cc by", "cc by-sa", "creativecommons attribution", "creativecommons attribution-sharealike"}
 
-def canonical(url):
-    url = urldefrag(url)[0]
-    p = urlparse(url)
-    # Drop tracking parameters but preserve catalog parameters needed for the source page.
-    return url
-
-class PageParser(HTMLParser):
+class TextExtractor(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.links = []
-        self.title_parts = []
-        self.text_parts = []
-        self.skip_depth = 0
-        self.title_depth = 0
-        self.in_body = False
-        self.skip_tags = {'script', 'style', 'noscript', 'svg', 'iframe', 'form', 'button', 'select', 'option'}
+        self.parts=[]; self.skip=0
     def handle_starttag(self, tag, attrs):
-        tag = tag.lower(); d = dict(attrs)
-        if tag == 'body': self.in_body = True
-        if tag == 'a' and d.get('href'):
-            self.links.append((d['href'].strip(), (d.get('title') or '').strip()))
-        if tag == 'title': self.title_depth += 1
-        if tag in self.skip_tags: self.skip_depth += 1
-        if tag in ('br', 'p', 'div', 'li', 'tr', 'td', 'th', 'h1', 'h2', 'h3', 'h4', 'section', 'article') and self.skip_depth == 0:
-            self.text_parts.append('\n')
+        if tag in ('script','style','noscript','svg'): self.skip += 1
+        if self.skip == 0 and tag in ('p','div','br','li','h1','h2','h3','section'): self.parts.append('\n')
     def handle_endtag(self, tag):
-        tag = tag.lower()
-        if tag == 'title' and self.title_depth: self.title_depth -= 1
-        if tag in self.skip_tags and self.skip_depth: self.skip_depth -= 1
-        if tag == 'body': self.in_body = False
-        if tag in ('p', 'div', 'li', 'tr', 'td', 'th', 'h1', 'h2', 'h3', 'h4', 'section', 'article') and self.skip_depth == 0:
-            self.text_parts.append('\n')
+        if tag in ('script','style','noscript','svg') and self.skip: self.skip -= 1
+        if self.skip == 0 and tag in ('p','div','li','h1','h2','h3','section'): self.parts.append('\n')
     def handle_data(self, data):
-        if self.title_depth: self.title_parts.append(data)
-        if self.skip_depth == 0 and data.strip(): self.text_parts.append(data.strip())
+        if not self.skip and data.strip(): self.parts.append(data.strip())
 
-def clean_text(raw):
-    raw = raw.replace('\xa0', ' ').replace('\u200f', '').replace('\u200e', '')
-    lines = [re.sub(r'\s+', ' ', line).strip() for line in raw.splitlines()]
-    lines = [line for line in lines if line]
-    # Collapse repeated adjacent lines and excessive menus/blank lines.
-    out=[]
-    for line in lines:
-        if not out or line != out[-1]: out.append(line)
-    return '\n'.join(out)
-
-def parse_page(html):
-    parser = PageParser()
-    try: parser.feed(html)
+def html_to_text(value):
+    if isinstance(value, list):
+        return '\n'.join(html_to_text(v) for v in value if v is not None)
+    if not isinstance(value, str): return ''
+    p=TextExtractor()
+    try: p.feed(value)
     except Exception: pass
-    title = clean_text(' '.join(parser.title_parts)) or ''
-    text = clean_text('\n'.join(parser.text_parts))
-    # Generic HTML pages can contain navigation; keep only substantial text pages.
-    return title[:200], text, parser.links
+    text=''.join(p.parts).replace('\xa0',' ').replace('\u200f','').replace('\u200e','')
+    lines=[re.sub(r'\s+',' ',x).strip() for x in text.splitlines()]
+    return '\n'.join(x for x in lines if x)
 
-def is_crawlable(url):
-    if not allowed_url(url): return False
-    p = urlparse(url)
-    path = p.path.lower()
-    if path.endswith(('.pdf', '.jpg', '.jpeg', '.png', '.gif', '.zip', '.epub', '.mp3', '.mp4', '.css', '.js')): return False
-    return '/books/' in path or '/catalog/' in path or path.rstrip('/').endswith('books')
+def license_allowed(license_value):
+    lic=(license_value or '').strip().lower().replace('_','-')
+    if not lic: return False
+    # Explicitly exclude non-commercial and unknown/copyrighted editions.
+    if 'nc' in lic or 'copyright' in lic or 'all rights reserved' in lic or 'unknown' in lic: return False
+    return lic in ALLOWED_LICENSES or lic.startswith('cc-by-') or lic.startswith('cc by-')
 
-def scan_worker(max_pages):
-    queue = list(BASES); seen = set(); found = {}; skipped = 0
-    with lock:
-        state.update(running=True, done=False, error='', pages=0, found=0, message='מתחיל סריקת דפי טקסט ציבוריים…', items=[], zip_path='', zip_name='', kind='text', skipped=0)
-    try:
-        session = requests.Session(); session.headers.update(HEADERS)
-        while queue and len(seen) < max_pages:
-            url = canonical(queue.pop(0))
-            if url in seen or not is_crawlable(url): continue
-            seen.add(url)
-            try:
-                resp = session.get(url, timeout=15, allow_redirects=True)
-                ctype = resp.headers.get('content-type', '').lower()
-                if resp.status_code != 200 or ('html' not in ctype and not resp.text[:100].lower().find('<html') >= 0):
-                    skipped += 1; resp.close(); continue
-                html = resp.text[:2_500_000]; resp.close()
-                title, text, links = parse_page(html)
-                path = urlparse(url).path.lower()
-                # Avoid indexing search/index pages unless they contain substantial book text.
-                if len(text) >= 500 and ('/books/' in path) and not any(x in path for x in ('/search', '/index.php')):
-                    key = url
-                    found[key] = {'url': url, 'title': (title or text.splitlines()[0] or 'טקסט ללא כותרת')[:180], 'kind': 'TEXT', 'chars': len(text), 'preview': text[:220].replace('\n', ' ')}
-                for href, link_title in links:
-                    nxt = canonical(urljoin(url, href))
-                    if is_crawlable(nxt) and nxt not in seen and nxt not in queue and len(queue) < max_pages * 4:
-                        queue.append(nxt)
-            except Exception:
-                skipped += 1
-            with lock:
-                state.update(pages=len(seen), found=len(found), items=list(found.values()), skipped=skipped,
-                             message=f'נסרקו {len(seen)} דפים · נמצאו {len(found)} דפי טקסט · דולגו {skipped}')
-            time.sleep(0.35)
-        with lock:
-            state.update(running=False, done=True, items=sorted(found.values(), key=lambda x: x['title'].casefold()),
-                         message=f'הסריקה הסתיימה: {len(seen)} דפים, {len(found)} דפי טקסט מתאימים; דולגו {skipped}. אם נמצאו 0, פתחו את פרטי השגיאות/הלוגים ב-Render ובדקו שהשרת יכול לגשת לאתר המקור.')
-    except Exception as e:
-        with lock: state.update(running=False, done=True, error=str(e)[:300], message='הסריקה נכשלה')
-
-def fetch_text(url, session):
-    resp = session.get(url, timeout=20)
-    resp.raise_for_status()
-    if 'html' not in resp.headers.get('content-type', '').lower():
-        raise ValueError('העמוד אינו HTML')
-    title, text, _ = parse_page(resp.text[:3_000_000])
-    if len(text) < 100: raise ValueError('לא נמצא טקסט קריא בעמוד')
-    return title or 'ללא כותרת', text
-
-def safe_filename(name):
-    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', name).strip(' ._')
-    return (name or 'text')[:100]
-
-def build_epub(path, books, book_title='ספריית חב״ד — טקסטים'):
-    uid = 'urn:uuid:' + str(uuid4())
-    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    with zipfile.ZipFile(path, 'w') as z:
-        z.writestr('mimetype', 'application/epub+zip', compress_type=zipfile.ZIP_STORED)
-        z.writestr('META-INF/container.xml', '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>', compress_type=zipfile.ZIP_DEFLATED)
-        css = 'body{direction:rtl;text-align:right;font-family:serif;line-height:1.8;margin:5%;} h1{text-align:center;} p{white-space:pre-wrap;}'
-        z.writestr('OEBPS/style.css', css)
-        manifest=[]; spine=[]; nav=[]
-        for i, (title, text, source) in enumerate(books, 1):
-            fn = f'chapter{i:04d}.xhtml'; ident=f'ch{i}'
-            body = '\n'.join('<p>'+escape(line)+'</p>' for line in text.splitlines() if line.strip())
-            xhtml = f'<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml" xml:lang="he" lang="he" dir="rtl"><head><title>{escape(title)}</title><link rel="stylesheet" type="text/css" href="style.css"/></head><body dir="rtl"><h1>{escape(title)}</h1>{body}<hr/><p>מקור: <a href="{escape(source, quote=True)}">העמוד המקורי</a></p></body></html>'
-            z.writestr('OEBPS/'+fn, xhtml)
-            manifest.append(f'<item id="{ident}" href="{fn}" media-type="application/xhtml+xml"/>')
-            spine.append(f'<itemref idref="{ident}"/>')
-            nav.append(f'<li><a href="{fn}">{escape(title)}</a></li>')
-        z.writestr('OEBPS/nav.xhtml', '<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="he" lang="he" dir="rtl"><head><title>תוכן עניינים</title></head><body dir="rtl"><nav epub:type="toc" id="toc"><h1>תוכן עניינים</h1><ol>'+''.join(nav)+'</ol></nav></body></html>')
-        manifest.append('<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>')
-        manifest.append('<item id="css" href="style.css" media-type="text/css"/>')
-        opf = f'<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="he"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">{uid}</dc:identifier><dc:title>{escape(book_title)}</dc:title><dc:language>he</dc:language><meta property="dcterms:modified">{now}</meta></metadata><manifest>{"".join(manifest)}</manifest><spine page-progression-direction="rtl">{"".join(spine)}</spine></package>'
-        z.writestr('OEBPS/content.opf', opf)
-
-def export_worker(urls, fmt):
-    with lock: state.update(running=True, done=False, error='', zip_path='', zip_name='', kind='export', message='מוריד דפי טקסט ציבוריים ומכין קובץ לקינדל…')
-    books=[]; skipped=0
-    try:
-        session=requests.Session(); session.headers.update(HEADERS)
-        for i, url in enumerate(urls, 1):
-            try:
-                if not allowed_url(url) or not is_crawlable(url): raise ValueError('כתובת לא מאושרת')
-                title, txt = fetch_text(url, session)
-                books.append((title, txt, url))
-            except Exception:
-                skipped += 1
-            with lock: state['message'] = f'אוסף טקסטים: {i}/{len(urls)} · הצליחו {len(books)} · דולגו {skipped}'
-            time.sleep(0.2)
-        if not books: raise RuntimeError('לא הצלחנו לחלץ טקסט קריא מהעמודים שנבחרו. ייתכן שהאתר מציג את התוכן בצורה דינמית או חוסם גישה אוטומטית.')
-        fd, path = tempfile.mkstemp(prefix='chabad-texts-', suffix='.zip'); os.close(fd)
-        with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
-            if fmt in ('epub', 'both'):
-                tmp = path + '.epub'
-                try:
-                    build_epub(tmp, books)
-                    z.write(tmp, 'ספריית-חבד-טקסטים.epub')
-                finally:
-                    if os.path.exists(tmp): os.remove(tmp)
-            if fmt in ('txt', 'both'):
-                for i, (title, txt, source) in enumerate(books, 1):
-                    z.writestr(f'TXT/{i:04d}-{safe_filename(title)}.txt', f'{title}\nמקור: {source}\n\n{txt}\n'.encode('utf-8'))
-                z.writestr('README.txt', f'נאספו {len(books)} עמודי טקסט.\nהקבצים נוצרו מעמודים ציבוריים; יש לבדוק את תנאי השימוש וזכויות היוצרים של כל יצירה.\n')
-        with lock: state.update(running=False, done=True, zip_path=path, zip_name='ספריית-חבד-טקסטים-לקינדל.zip', message=f'החבילה מוכנה: {len(books)} עמודי טקסט; דולגו {skipped}')
-    except Exception as e:
-        with lock: state.update(running=False, done=True, error=str(e)[:400], message='לא הצלחנו להכין חבילת טקסטים')
+def make_epub(title, text, source, license_value):
+    safe_title=escape(title or 'טקסט מספריא')
+    ident='urn:uuid:'+str(uuid.uuid4())
+    stamp=datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    xhtml='''<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="he" lang="he" dir="rtl"><head><title>'''+safe_title+'''</title><meta charset="utf-8"/><style>body{direction:rtl;text-align:right;font-family:serif;line-height:1.8}h1{text-align:center}p{white-space:pre-wrap}</style></head><body><h1>'''+safe_title+'''</h1><p>מקור: '''+escape(source)+'''\nרישיון: '''+escape(license_value)+'''</p><hr/><p>'''+escape(text).replace('\n','</p><p>')+'''</p></body></html>'''
+    container='<?xml version="1.0" encoding="UTF-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>'
+    opf='''<?xml version="1.0" encoding="UTF-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="he" dir="rtl"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">'''+ident+'''</dc:identifier><dc:title>'''+safe_title+'''</dc:title><dc:language>he</dc:language><dc:creator>ספריית חב״ד לקינדל — כלי ייצוא</dc:creator><dc:description>מקור: '''+escape(source)+'''; רישיון: '''+escape(license_value)+'''</dc:description><meta property="dcterms:modified">'''+stamp+'''</meta></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="content" href="content.xhtml" media-type="application/xhtml+xml"/></manifest><spine page-progression-direction="rtl"><itemref idref="content"/></spine></package>'''
+    nav='<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="he" xml:lang="he" dir="rtl"><head><title>תוכן עניינים</title></head><body><nav epub:type="toc"><h1>תוכן עניינים</h1><ol><li><a href="content.xhtml">'+safe_title+'</a></li></ol></nav></body></html>'
+    b=BytesIO()
+    with zipfile.ZipFile(b,'w') as z:
+        z.writestr('mimetype','application/epub+zip',compress_type=zipfile.ZIP_STORED)
+        z.writestr('META-INF/container.xml',container,compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr('OEBPS/content.opf',opf,compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr('OEBPS/content.xhtml',xhtml,compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr('OEBPS/nav.xhtml',nav,compress_type=zipfile.ZIP_DEFLATED)
+    b.seek(0); return b
 
 @app.get('/')
-def home(): return render_template('index.html')
+def index():
+    return render_template('index.html', catalog=CATALOG)
 
-@app.get('/api/status')
-def status():
-    with lock:
-        return jsonify({**{k:v for k,v in state.items() if k != 'zip_path'}, 'zip_ready': bool(state.get('zip_path') and os.path.exists(state.get('zip_path','')))})
-
-@app.post('/api/scan')
-def scan():
-    with lock:
-        if state['running']: return jsonify(ok=False, error='כבר מתבצעת פעולה'), 409
-    data = request.get_json(silent=True) or {}
-    try: max_pages = max(20, min(500, int(data.get('max_pages', 150))))
-    except Exception: max_pages = 150
-    threading.Thread(target=scan_worker, args=(max_pages,), daemon=True).start()
-    return jsonify(ok=True)
-
-@app.post('/api/export')
-def export_texts():
-    with lock:
-        if state['running']: return jsonify(ok=False, error='כבר מתבצעת פעולה'), 409
-    data = request.get_json(silent=True) or {}; urls = data.get('urls', []); fmt = data.get('format', 'epub')
-    if fmt not in ('epub', 'txt', 'both'): return jsonify(ok=False, error='פורמט לא תקין'), 400
-    urls = list(dict.fromkeys(u for u in urls if isinstance(u, str) and allowed_url(u) and is_crawlable(u)))
-    if not urls: return jsonify(ok=False, error='בחר לפחות דף טקסט אחד'), 400
-    if len(urls) > 100: return jsonify(ok=False, error='אפשר להכין עד 100 דפי טקסט בכל חבילה'), 400
-    threading.Thread(target=export_worker, args=(urls, fmt), daemon=True).start()
-    return jsonify(ok=True)
-
-@app.get('/api/file')
-def file():
-    with lock: path = state.get('zip_path', ''); name = state.get('zip_name') or 'chabad-library-texts.zip'
-    if not path or not os.path.exists(path): return 'החבילה עדיין לא מוכנה או נמחקה מהשרת. הפעל את הייצוא מחדש.', 404
-    return send_file(path, as_attachment=True, download_name=name)
+@app.post('/export')
+def export_text():
+    ref=(request.form.get('ref') or '').strip()
+    fmt=(request.form.get('format') or 'epub').strip().lower()
+    if not ref or len(ref)>180 or not re.fullmatch(r'[\w .,:;()\-״׳]+', ref, flags=re.UNICODE):
+        return render_template('index.html', catalog=CATALOG, error='יש להזין מראה מקום תקין מספריא, לדוגמה Berakhot 2a או Genesis 1.'), 400
+    if fmt not in ('epub','txt'): fmt='epub'
+    api_ref=quote(ref.replace(' ', '_'), safe='._-,:;()')
+    url='https://www.sefaria.org/api/v3/texts/'+api_ref+'?version=hebrew'
+    try:
+        req=Request(url,headers={'User-Agent':'ChabadLibraryKindle/1.5 (personal text export)','Accept':'application/json'})
+        with urlopen(req,timeout=20) as response:
+            if response.status != 200: raise ValueError('ספריא החזירה תשובת שגיאה')
+            data=json.loads(response.read(4_000_000).decode('utf-8'))
+    except Exception as exc:
+        return render_template('index.html', catalog=CATALOG, error='לא הצלחתי לקבל טקסט מספריא כרגע. בדוק את המראה מקום או נסה שוב מאוחר יותר. פרטים: '+str(exc)[:220]), 502
+    versions=data.get('versions') or []
+    if isinstance(versions,dict): versions=[versions]
+    chosen=None
+    for v in versions:
+        if (v.get('language') or '').lower().startswith('he') and license_allowed(v.get('license')):
+            chosen=v; break
+    if not chosen:
+        return render_template('index.html', catalog=CATALOG, error='לא נמצאה מהדורה עברית עם רישיון ייצוא מאושר (נחלת הכלל, CC0, CC-BY או CC-BY-SA). לא ייצאנו טקסט שרישיונו לא ברור או מוגבל.'), 403
+    text=html_to_text(chosen.get('text'))
+    if len(text.strip())<30:
+        return render_template('index.html', catalog=CATALOG, error='ספריא לא החזירה מספיק טקסט למראה המקום הזה. נסה פרק או עמוד ספציפי.'), 422
+    title=chosen.get('versionTitleInHebrew') or chosen.get('versionTitle') or data.get('ref') or ref
+    source_url='https://www.sefaria.org/'+quote(ref.replace(' ', '_'),safe='._-,:;()')
+    lic=chosen.get('license') or 'Public Domain'
+    if fmt=='txt':
+        content=(title+'\nמקור: '+source_url+'\nרישיון: '+lic+'\n\n'+text+'\n').encode('utf-8-sig')
+        return send_file(BytesIO(content),as_attachment=True,download_name='sefaria_text.txt',mimetype='text/plain; charset=utf-8')
+    return send_file(make_epub(title,text,source_url,lic),as_attachment=True,download_name='sefaria_text.epub',mimetype='application/epub+zip')
 
 @app.get('/health')
-def health(): return jsonify(status='ok', version='1.3-text')
+def health(): return {'status':'ok','version':'1.5'}
 
-if __name__ == '__main__': app.run(host='0.0.0.0', port=int(os.environ.get('PORT', '5000')), debug=False)
+if __name__=='__main__':
+    app.run(host='0.0.0.0',port=5000,debug=False)
